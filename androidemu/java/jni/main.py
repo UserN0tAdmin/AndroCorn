@@ -1399,7 +1399,8 @@ class JNIEnv:
         return self.__create_instance(emu, clazz_idx, method_id, args_v, 1)
 
     @native_method
-    def new_object_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_object_a(self, emu: "Emulator", env, clazz_idx, method_id, args_a):
+        return self.__create_instance(emu, clazz_idx, method_id, args_a, 2)
     @native_method
     def alloc_object(self, emu: "Emulator", env, clazz_idx):
         jclazz = self.get_reference(clazz_idx)
