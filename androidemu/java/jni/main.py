@@ -12,7 +12,8 @@ from .reference import jobject, jclass
 from ..reference_table import ReferenceTable
 from ...native.helpers.jni_native import (
     read_args32, read_args64,
-    read_args_v32, read_args_v64
+    read_args_v32, read_args_v64,
+    read_args_a32, read_args_a64
 )
 from ...native.helpers.method import native_method
 from ..class_def import JavaClassDef
@@ -74,6 +75,8 @@ class JNIEnv:
             return self.__read_args(self, emu.mu, args, args_type_list)
         elif arg_type == 1:
             return self.__read_args_v(self, emu.mu, args, args_type_list)
+        elif arg_type == 2:
+            return self.__read_args_a(self, emu.mu, args, args_type_list)
         raise RuntimeError(f"Unsupported arg_type: {arg_type}")
 
     @staticmethod
@@ -221,6 +224,89 @@ class JNIEnv:
         raw_bits = struct.unpack("<Q", struct.pack("<d", v))[0]
         return (raw_bits & 0xFFFFFFFF, raw_bits >> 32)
 
+    # Call<Type>MethodA / CallStatic<Type>MethodA (arguments come as a jvalue[])
+    #
+    # ret_kind is the JNI return type letter of the function the native code actually called
+    # (Z B C S I J F D L V), NOT the declared one of the mocked method: it decides in which
+    # register(s) and in which width the result is handed back to the native caller.
+    def __call_a_method(self, emu: "Emulator", obj_idx: int, method_id: int, args_a: int, ret_kind: str):
+        obj = self.get_reference(obj_idx)
+        if not isinstance(obj, jobject):
+            raise ValueError("Expected a jobject.")
+
+        pyobj = self.jobject_to_pyobject(obj)
+        clazz: "JavaClassDef" = pyobj.__class__
+
+        method = clazz.find_method_by_id(method_id)
+        if method is None:
+            raise RuntimeError(f"Could not find method {method_id} in object by id.")
+
+        call_args = self.__read_args_common(emu, args_a, method.args_list, arg_type=2)
+        # look the method up again by name: an override in the object's own class wins over the
+        # one the method id was taken from (virtual dispatch)
+        real_method = clazz.find_method(method.name, method.signature) or method
+        v = real_method.func(pyobj, emu, *call_args)
+        return self.__a_return(emu, v, ret_kind)
+
+    def __call_static_a_method(self, emu: "Emulator", clazz_idx: int, method_id: int, args_a: int, ret_kind: str):
+        clazz = self.get_reference(clazz_idx)
+        if not isinstance(clazz, jclass):
+            raise ValueError("Expected a jclass.")
+
+        pyclazz = clazz.value.get_py_clazz()
+
+        method = pyclazz.find_method_by_id(method_id)
+        if method is None:
+            raise RuntimeError(f"Could not find static method {method_id} by id.")
+
+        call_args = self.__read_args_common(emu, args_a, method.args_list, arg_type=2)
+        v = method.func(emu, *call_args)
+        return self.__a_return(emu, v, ret_kind)
+
+    def __a_return(self, emu: "Emulator", v, ret_kind: str):
+        """
+        Converts what a mocked method returned into what native_method has to put into the
+        return register(s). float/double are written here (they do not travel in r0/x0) and
+        None is returned so that native_method does not overwrite them.
+        """
+        if ret_kind == "V":
+            return None
+
+        if ret_kind == "L":
+            if v is None:
+                return JAVA_NULL
+            if isinstance(v, int): # JAVA_NULL or an already created reference
+                return v
+            return self.add_local_reference(v if isinstance(v, jobject) else jobject(v))
+
+        if ret_kind == "F" or ret_kind == "D":
+            v = 0.0 if v is None else float(v)
+            if ret_kind == "D":
+                bits = struct.unpack("<Q", struct.pack("<d", v))[0]
+            else:
+                try:
+                    bits = struct.unpack("<I", struct.pack("<f", v))[0]
+                except OverflowError: # out of the float range -> +-inf, as a Java (float) cast does
+                    bits = 0x7F800000 if v > 0 else 0xFF800000
+            emu.registers.set_fp_return(bits, is_double=(ret_kind == "D"))
+            return None
+
+        iv = 0 if v is None else int(v)
+        if ret_kind == "Z":
+            return 1 if iv else 0
+        if ret_kind == "B":
+            return iv & 0xFF
+        if ret_kind == "C" or ret_kind == "S":
+            return iv & 0xFFFF
+        if ret_kind == "I":
+            return iv & 0xFFFFFFFF
+        if ret_kind == "J":
+            iv &= 0xFFFFFFFFFFFFFFFF
+            if emu.arch == emu_const.ARCH_ARM64:
+                return iv
+            return (iv & 0xFFFFFFFF, iv >> 32) # r0:r1
+        raise ValueError(f"Unknown return kind {ret_kind!r}")
+
     # =========================================================================
     # 2. INITIALIZATION & VTABLE MAPPING
     # =========================================================================
@@ -238,9 +324,11 @@ class JNIEnv:
         if arch == emu_const.ARCH_ARM32:
             self.__read_args = read_args32
             self.__read_args_v = read_args_v32
+            self.__read_args_a = read_args_a32
         elif arch == emu_const.ARCH_ARM64:
             self.__read_args = read_args64
             self.__read_args_v = read_args_v64
+            self.__read_args_a = read_args_a64
         else:
             raise NotImplementedError(f"Unsupported arch {arch}")
 
@@ -586,48 +674,86 @@ class JNIEnv:
     def call_static_void_method_v(self, emu: "Emulator", env, clazz_idx, method_id, args):
         self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, False)
 
-    # Stubbed _a variants
+    # jvalue[] variants
     @native_method
-    def call_object_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_boolean_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_byte_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_char_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_short_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_int_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_long_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_float_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_double_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_void_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_object_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "L")
 
     @native_method
-    def call_static_object_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_boolean_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "Z")
+
     @native_method
-    def call_static_boolean_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_byte_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "B")
+
     @native_method
-    def call_static_byte_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_char_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "C")
+
     @native_method
-    def call_static_char_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_short_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "S")
+
     @native_method
-    def call_static_short_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_int_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "I")
+
     @native_method
-    def call_static_int_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_long_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "J")
+
     @native_method
-    def call_static_long_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_float_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "F")
+
     @native_method
-    def call_static_float_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_double_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "D")
+
     @native_method
-    def call_static_double_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_void_method_a(self, emu: "Emulator", env, obj_idx, method_id, args):
+        self.__call_a_method(emu, obj_idx, method_id, args, "V")
+
     @native_method
-    def call_static_void_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_static_object_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "L")
+
+    @native_method
+    def call_static_boolean_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "Z")
+
+    @native_method
+    def call_static_byte_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "B")
+
+    @native_method
+    def call_static_char_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "C")
+
+    @native_method
+    def call_static_short_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "S")
+
+    @native_method
+    def call_static_int_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "I")
+
+    @native_method
+    def call_static_long_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "J")
+
+    @native_method
+    def call_static_float_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "F")
+
+    @native_method
+    def call_static_double_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        return self.__call_static_a_method(emu, clazz_idx, method_id, args, "D")
+
+    @native_method
+    def call_static_void_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
+        self.__call_static_a_method(emu, clazz_idx, method_id, args, "V")
 
     # Nonvirtual stubs
     @native_method

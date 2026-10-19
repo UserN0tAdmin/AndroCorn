@@ -132,3 +132,63 @@ def read_args_v64(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) 
                 res.append(v)
                 
     return res
+
+# jvalue[] (the "A" variants: Call<Type>MethodA, CallStatic<Type>MethodA, NewObjectA, ...)
+#
+# jvalue is a union, so every element of the array occupies 8 bytes on both ARM32 and ARM64
+# and a caller only writes the bytes of the member it uses: for a jint the upper 4 bytes of
+# the slot are garbage, for a jboolean the upper 7 bytes. That is why each argument is
+# decoded with its exact width (little endian) instead of reading the whole slot. Unlike the
+# va_list variants nothing is passed in registers here, so there is no GPR/VR split to follow.
+#
+# Values are given to the mocks with Java semantics: signed byte/short/int/long, unsigned
+# char, jboolean as 0/1, jfloat/jdouble as Python float, references resolved to the objects
+# behind them (JAVA_NULL for null).
+_JVALUE_SIZE = 8
+
+_JVALUE_FMT = {
+    'jboolean': '<B',
+    'jbyte': '<b',
+    'jchar': '<H',
+    'jshort': '<h',
+    'jint': '<i',
+    'jlong': '<q',
+    'jfloat': '<f',
+    'jdouble': '<d',
+}
+
+_JVALUE_REF_TYPES = frozenset(('jobject', 'jstring', 'jclass', 'jthrowable', 'jarray', 'jweak'))
+
+
+def _read_args_a(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List, ref_fmt: str) -> List:
+    # A method without arguments may be called with a NULL (or garbage) jvalue pointer.
+    if not args_type_list: return []
+
+    raw = mu.mem_read(args_ptr, _JVALUE_SIZE * len(args_type_list))
+    res = []
+    get_ref = jni.get_reference
+
+    for i, t in enumerate(args_type_list):
+        off = i * _JVALUE_SIZE
+        fmt = _JVALUE_FMT.get(t)
+        if fmt is not None:
+            v = struct.unpack_from(fmt, raw, off)[0]
+            res.append((1 if v else 0) if t == 'jboolean' else v)
+        elif t in _JVALUE_REF_TYPES or t.endswith('Array'): # jstring, jobject, jbyteArray, ...
+            v = struct.unpack_from(ref_fmt, raw, off)[0]
+            ref = get_ref(v)
+            res.append(JAVA_NULL if ref is None else ref.value)
+        else:
+            raise ValueError(
+                f"Unsupported argument type {t!r} in args_list for a jvalue[] call "
+                f"(use one of: {', '.join(sorted(_JVALUE_FMT))}, {', '.join(sorted(_JVALUE_REF_TYPES))})"
+            )
+
+    return res
+
+def read_args_a32(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) -> List:
+    # jobject is a 4 byte pointer, the upper half of its slot is not meaningful
+    return _read_args_a(jni, mu, args_ptr, args_type_list, '<I')
+
+def read_args_a64(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) -> List:
+    return _read_args_a(jni, mu, args_ptr, args_type_list, '<Q')
