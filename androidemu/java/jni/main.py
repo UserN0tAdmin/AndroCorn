@@ -67,6 +67,10 @@ def _allocate_py_instance(pyclazz: JavaClassDef):
     return pyclazz.__new__(pyclazz)
 
 
+# JNI return kinds that are not returned like an int: jlong, jfloat, jdouble (see JNIEnv.__wide_or_fp_return)
+_WIDE_OR_FP_KINDS = ("J", "F", "D")
+
+
 class JNIEnv:
     """
     Simulated JNIEnv (JNINativeInterface).
@@ -134,7 +138,7 @@ class JNIEnv:
             raise ValueError("Expected a jobject.")
         self._globals.remove(obj)
 
-    def __dyncall(self, emu: "Emulator", is_static: bool, is_wide: bool = False):
+    def __dyncall(self, emu: "Emulator", is_static: bool, ret_kind: str = ""):
         regs = emu.registers
         obj_or_cls_idx = regs.v_reg_1
         method_id = regs.v_reg_2
@@ -166,28 +170,23 @@ class JNIEnv:
             real_method = clazz.find_method(method.name, method.signature)
             v = real_method.func(target_instance, emu, *call_args)
 
-        if not is_wide:
-            if v is not None and not isinstance(v, (int, float, bool)):
-                return self.add_local_reference(jobject(v))
-            return v
-        else:
-            if isinstance(v, float):
-                raw_bits = struct.unpack("<Q", struct.pack("<d", v))[0]
-            else:
-                raw_bits = int(v) & 0xFFFFFFFFFFFFFFFF
-            return (raw_bits & 0xFFFFFFFF, raw_bits >> 32)
+        if ret_kind in _WIDE_OR_FP_KINDS:
+            return self.__wide_or_fp_return(emu, v, ret_kind)
+        if v is not None and not isinstance(v, (int, float, bool)):
+            return self.add_local_reference(jobject(v))
+        return v
 
-    def __dispatch_call(self, emu: "Emulator", is_static: bool, is_wide: bool = False):
-        res = self.__dyncall(emu, is_static, is_wide)
+    # ret_kind is "J" (long), "F" (float), "D" (double) or "" for everything else: those three
+    # are not returned like an int, see __wide_or_fp_return
+    def __dispatch_call(self, emu: "Emulator", is_static: bool, ret_kind: str = ""):
+        res = self.__dyncall(emu, is_static, ret_kind)
         if res is not None:
-            if is_wide:
-                rlow, rhigh = res
-                emu.registers.v_reg_0 = rlow
-                emu.registers.v_reg_1 = rhigh
+            if isinstance(res, tuple):
+                emu.registers.v_reg_0, emu.registers.v_reg_1 = res
             else:
                 emu.registers.v_reg_0 = res
 
-    def __call_varargs_method(self, emu: "Emulator", env, obj_idx: int, method_id: int, args_v, is_wide: bool = False):
+    def __call_varargs_method(self, emu: "Emulator", env, obj_idx: int, method_id: int, args_v, ret_kind: str = ""):
         obj = self.get_reference(obj_idx)
         if not isinstance(obj, jobject):
             raise ValueError("Expected a jobject.")
@@ -204,13 +203,11 @@ class JNIEnv:
         real_method = clazz.find_method(method.name, method.signature)
         v = real_method.func(pyobj, emu, *constructor_args)
 
-        if not is_wide:
-            return v
-        rhigh = v >> 32
-        rlow = v & 0xFFFFFFFF
-        return (rlow, rhigh)
+        if ret_kind in _WIDE_OR_FP_KINDS:
+            return self.__wide_or_fp_return(emu, v, ret_kind)
+        return v
 
-    def __call_static_varargs_method(self, emu: "Emulator", env, clazz_idx: int, method_id: int, args_v, is_wide: bool = False):
+    def __call_static_varargs_method(self, emu: "Emulator", env, clazz_idx: int, method_id: int, args_v, ret_kind: str = ""):
         clazz = self.get_reference(clazz_idx)
         if not isinstance(clazz, jclass):
             raise ValueError("Expected a jclass.")
@@ -225,10 +222,9 @@ class JNIEnv:
         constructor_args = self.__read_args_common(emu, args_v, method.args_list, arg_type=1)
         v = method.func(emu, *constructor_args)
 
-        if not is_wide:
-            return v
-        raw_bits = struct.unpack("<Q", struct.pack("<d", v))[0]
-        return (raw_bits & 0xFFFFFFFF, raw_bits >> 32)
+        if ret_kind in _WIDE_OR_FP_KINDS:
+            return self.__wide_or_fp_return(emu, v, ret_kind)
+        return v
 
     # Call<Type>MethodA / CallStatic<Type>MethodA (arguments come as a jvalue[])
     #
@@ -285,17 +281,8 @@ class JNIEnv:
                 return v
             return self.add_local_reference(v if isinstance(v, jobject) else jobject(v))
 
-        if ret_kind == "F" or ret_kind == "D":
-            v = 0.0 if v is None else float(v)
-            if ret_kind == "D":
-                bits = struct.unpack("<Q", struct.pack("<d", v))[0]
-            else:
-                try:
-                    bits = struct.unpack("<I", struct.pack("<f", v))[0]
-                except OverflowError: # out of the float range -> +-inf, as a Java (float) cast does
-                    bits = 0x7F800000 if v > 0 else 0xFF800000
-            emu.registers.set_fp_return(bits, is_double=(ret_kind == "D"))
-            return None
+        if ret_kind in _WIDE_OR_FP_KINDS:
+            return self.__wide_or_fp_return(emu, v, ret_kind)
 
         iv = 0 if v is None else int(v)
         if ret_kind == "Z":
@@ -306,12 +293,35 @@ class JNIEnv:
             return iv & 0xFFFF
         if ret_kind == "I":
             return iv & 0xFFFFFFFF
+        raise ValueError(f"Unknown return kind {ret_kind!r}")
+
+    def __wide_or_fp_return(self, emu: "Emulator", v, ret_kind: str):
+        """
+        jlong ("J"), jfloat ("F") and jdouble ("D") results, for every kind of call and field getter.
+
+          ARM64: a jlong is one 64 bit value in x0; float/double are returned in s0/d0.
+          ARM32: a jlong / jdouble is a r0 (low) : r1 (high) pair, a jfloat is in r0 (softfp).
+
+        Returns what native_method has to put into the return registers: an int for x0, a
+        (low, high) tuple for r0:r1, or None when the value has already been written here
+        (float/double do not travel in r0/x0).
+        """
         if ret_kind == "J":
-            iv &= 0xFFFFFFFFFFFFFFFF
+            iv = (0 if v is None else int(v)) & 0xFFFFFFFFFFFFFFFF
             if emu.arch == emu_const.ARCH_ARM64:
                 return iv
-            return (iv & 0xFFFFFFFF, iv >> 32) # r0:r1
-        raise ValueError(f"Unknown return kind {ret_kind!r}")
+            return (iv & 0xFFFFFFFF, iv >> 32)
+
+        v = 0.0 if v is None else float(v)
+        if ret_kind == "D":
+            bits = struct.unpack("<Q", struct.pack("<d", v))[0]
+        else:
+            try:
+                bits = struct.unpack("<I", struct.pack("<f", v))[0]
+            except OverflowError: # out of the float range -> +-inf, as a Java (float) cast does
+                bits = 0x7F800000 if v > 0 else 0xFF800000
+        emu.registers.set_fp_return(bits, is_double=(ret_kind == "D"))
+        return None
 
     # =========================================================================
     # 2. INITIALIZATION & VTABLE MAPPING
@@ -574,27 +584,27 @@ class JNIEnv:
     # 3. METHOD INVOCATION (DYNAMIC / AUTO-ARITY)
     # =========================================================================
 
-    def call_object_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_boolean_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_byte_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_char_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_short_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_int_method(self, emu: "Emulator"):     self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_long_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False, is_wide=True)
-    def call_float_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=False, is_wide=False)
-    def call_double_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=False, is_wide=True)
-    def call_void_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False, is_wide=False)
+    def call_object_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=False)
+    def call_boolean_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False)
+    def call_byte_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False)
+    def call_char_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False)
+    def call_short_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=False)
+    def call_int_method(self, emu: "Emulator"):     self.__dispatch_call(emu, is_static=False)
+    def call_long_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False, ret_kind="J")
+    def call_float_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=False, ret_kind="F")
+    def call_double_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=False, ret_kind="D")
+    def call_void_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=False)
 
-    def call_static_object_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_boolean_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_byte_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_char_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_short_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_int_method(self, emu: "Emulator"):     self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_long_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True, is_wide=True)
-    def call_static_float_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=True, is_wide=False)
-    def call_static_double_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=True, is_wide=True)
-    def call_static_void_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True, is_wide=False)
+    def call_static_object_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=True)
+    def call_static_boolean_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=True)
+    def call_static_byte_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True)
+    def call_static_char_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True)
+    def call_static_short_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=True)
+    def call_static_int_method(self, emu: "Emulator"):     self.__dispatch_call(emu, is_static=True)
+    def call_static_long_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True, ret_kind="J")
+    def call_static_float_method(self, emu: "Emulator"):   self.__dispatch_call(emu, is_static=True, ret_kind="F")
+    def call_static_double_method(self, emu: "Emulator"):  self.__dispatch_call(emu, is_static=True, ret_kind="D")
+    def call_static_void_method(self, emu: "Emulator"):    self.__dispatch_call(emu, is_static=True)
 
     # =========================================================================
     # 4. METHOD INVOCATION (VARARGS: _v / _a)
@@ -626,15 +636,15 @@ class JNIEnv:
 
     @native_method
     def call_long_method_v(self, emu: "Emulator", env, obj_idx, method_id, args):
-        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, True)
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, "J")
 
     @native_method
     def call_float_method_v(self, emu: "Emulator", env, obj_idx, method_id, args):
-        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, False)
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, "F")
 
     @native_method
     def call_double_method_v(self, emu: "Emulator", env, obj_idx, method_id, args):
-        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, True)
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, "D")
 
     @native_method
     def call_void_method_v(self, emu: "Emulator", env, obj_idx, method_id, args):
@@ -666,15 +676,15 @@ class JNIEnv:
 
     @native_method
     def call_static_long_method_v(self, emu: "Emulator", env, clazz_idx, method_id, args):
-        return self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, True)
+        return self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, "J")
 
     @native_method
     def call_static_float_method_v(self, emu: "Emulator", env, clazz_idx, method_id, args):
-        return self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, False)
+        return self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, "F")
 
     @native_method
     def call_static_double_method_v(self, emu: "Emulator", env, clazz_idx, method_id, args):
-        return self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, True)
+        return self.__call_static_varargs_method(emu, env, clazz_idx, method_id, args, "D")
 
     @native_method
     def call_static_void_method_v(self, emu: "Emulator", env, clazz_idx, method_id, args):
@@ -841,7 +851,7 @@ class JNIEnv:
             raise RuntimeError(f"Could not find field ('{name}', '{sig}') in class {pyclazz.jvm_name}.")
         return 0 if field.ignore else field.jvm_id
 
-    def __get_field_val(self, emu: "Emulator", obj_idx: int, field_id: int, is_wide: bool = False):
+    def __get_field_val(self, emu: "Emulator", obj_idx: int, field_id: int, ret_kind: str = ""):
         obj = self.get_reference(obj_idx)
         if not isinstance(obj, jobject):
             raise ValueError("Expected a jobject.")
@@ -852,9 +862,9 @@ class JNIEnv:
             raise RuntimeError(f"Could not find field {field_id} in object {pyobj.jvm_name} by id.")
 
         v = getattr(pyobj, field.name)
-        if not is_wide:
-            return v
-        return (v & 0xFFFFFFFF, v >> 32)
+        if ret_kind in _WIDE_OR_FP_KINDS:
+            return self.__wide_or_fp_return(emu, v, ret_kind)
+        return v
 
     @native_method
     def get_object_field(self, emu: "Emulator", env, obj_idx, field_id):  return self.__get_field_val(emu, obj_idx, field_id)
@@ -869,11 +879,11 @@ class JNIEnv:
     @native_method
     def get_int_field(self, emu: "Emulator", env, obj_idx, field_id):     return self.__get_field_val(emu, obj_idx, field_id)
     @native_method
-    def get_long_field(self, emu: "Emulator", env, obj_idx, field_id):    return self.__get_field_val(emu, obj_idx, field_id, is_wide=True)
+    def get_long_field(self, emu: "Emulator", env, obj_idx, field_id):    return self.__get_field_val(emu, obj_idx, field_id, "J")
     @native_method
-    def get_float_field(self, emu: "Emulator", env, obj_idx, field_id):   return self.__get_field_val(emu, obj_idx, field_id)
+    def get_float_field(self, emu: "Emulator", env, obj_idx, field_id):   return self.__get_field_val(emu, obj_idx, field_id, "F")
     @native_method
-    def get_double_field(self, emu: "Emulator", env, obj_idx, field_id):  raise NotImplementedError()
+    def get_double_field(self, emu: "Emulator", env, obj_idx, field_id):  return self.__get_field_val(emu, obj_idx, field_id, "D")
 
     def __set_field_val(self, emu: "Emulator", obj_idx: int, field_id: int, value, is_obj: bool = False):
         obj = self.get_reference(obj_idx)
@@ -922,35 +932,35 @@ class JNIEnv:
             raise RuntimeError(f"Could not find static field ('{name}', '{sig}') in class {pyclazz.jvm_name}.")
         return 0 if field.ignore else field.jvm_id
 
-    def __get_static_field_val(self, clazz_idx: int, field_id: int, is_wide: bool = False):
+    def __get_static_field_val(self, emu: "Emulator", clazz_idx: int, field_id: int, ret_kind: str = ""):
         clazz = self.get_reference(clazz_idx)
         class_obj = clazz.value
         pyclazz = class_obj.get_py_clazz()
 
         field = pyclazz.find_field_by_id(field_id)
         v = field.static_value
-        if not is_wide:
-            return v
-        return (v & 0xFFFFFFFF, v >> 32)
+        if ret_kind in _WIDE_OR_FP_KINDS:
+            return self.__wide_or_fp_return(emu, v, ret_kind)
+        return v
 
     @native_method
-    def get_static_object_field(self, emu: "Emulator", env, clazz_idx, field_id):  return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_object_field(self, emu: "Emulator", env, clazz_idx, field_id):  return self.__get_static_field_val(emu, clazz_idx, field_id)
     @native_method
-    def get_static_boolean_field(self, emu: "Emulator", env, clazz_idx, field_id): return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_boolean_field(self, emu: "Emulator", env, clazz_idx, field_id): return self.__get_static_field_val(emu, clazz_idx, field_id)
     @native_method
-    def get_static_byte_field(self, emu, env, clazz_idx, field_id):                return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_byte_field(self, emu, env, clazz_idx, field_id):                return self.__get_static_field_val(emu, clazz_idx, field_id)
     @native_method
-    def get_static_char_field(self, emu: "Emulator", env, clazz_idx, field_id):    return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_char_field(self, emu: "Emulator", env, clazz_idx, field_id):    return self.__get_static_field_val(emu, clazz_idx, field_id)
     @native_method
-    def get_static_short_field(self, emu: "Emulator", env, clazz_idx, field_id):   return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_short_field(self, emu: "Emulator", env, clazz_idx, field_id):   return self.__get_static_field_val(emu, clazz_idx, field_id)
     @native_method
-    def get_static_int_field(self, emu: "Emulator", env, clazz_idx, field_id):     return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_int_field(self, emu: "Emulator", env, clazz_idx, field_id):     return self.__get_static_field_val(emu, clazz_idx, field_id)
     @native_method
-    def get_static_long_field(self, emu: "Emulator", env, clazz_idx, field_id):    return self.__get_static_field_val(clazz_idx, field_id, is_wide=True)
+    def get_static_long_field(self, emu: "Emulator", env, clazz_idx, field_id):    return self.__get_static_field_val(emu, clazz_idx, field_id, "J")
     @native_method
-    def get_static_float_field(self, emu: "Emulator", env, clazz_idx, field_id):   return self.__get_static_field_val(clazz_idx, field_id)
+    def get_static_float_field(self, emu: "Emulator", env, clazz_idx, field_id):   return self.__get_static_field_val(emu, clazz_idx, field_id, "F")
     @native_method
-    def get_static_double_field(self, emu: "Emulator", env, clazz_idx, field_id):  return self.__get_static_field_val(clazz_idx, field_id, is_wide=True)
+    def get_static_double_field(self, emu: "Emulator", env, clazz_idx, field_id):  return self.__get_static_field_val(emu, clazz_idx, field_id, "D")
 
     @native_method
     def set_static_object_field(self, emu: "Emulator", env): raise NotImplementedError()
