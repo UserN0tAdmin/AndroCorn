@@ -13,6 +13,31 @@ if TYPE_CHECKING:
 
 # JNIEnv tools
 
+# JNI type names that hold a reference (resolved through the JNIEnv reference tables).
+_REF_TYPE_NAMES = frozenset(('jobject', 'jstring', 'jclass', 'jthrowable', 'jarray', 'jweak'))
+_INT_TYPE_NAMES = frozenset(('jboolean', 'jbyte', 'jchar', 'jshort', 'jint'))
+
+
+def _arg_kind(t: str) -> str:
+    """
+    Classifies an args_list type name for the register / va_list readers:
+    'l' jlong, 'd' jdouble, 'f' jfloat, 'o' reference, 'i' int-like.
+
+    The readers used to look at t[1] only, which cannot tell jshort from jstring (both 's',
+    so a short was looked up as a reference) and misses jclass / jarray / jbyteArray / ...
+    (read as plain ints). The known JNI names are matched in full; any other name keeps the old
+    first-letter behaviour so existing custom args_list values do not change meaning.
+    """
+    if t == 'jlong': return 'l'
+    if t == 'jdouble': return 'd'
+    if t == 'jfloat': return 'f'
+    if t in _REF_TYPE_NAMES or t.endswith('Array'): return 'o'
+    if t in _INT_TYPE_NAMES: return 'i'
+
+    c = t[1]
+    if c == 's': return 'o'
+    return c
+
 
 def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> List:
     if not args_type_list: return []
@@ -25,16 +50,17 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> Li
     for t in args_type_list:
         if idx >= n: break
         
-        if t[1] == 'l' or t[1] == 'd': # jlong, jdouble
+        c = _arg_kind(t)
+        if c == 'l' or c == 'd': # jlong, jdouble
             idx += (3 + idx) & 1
             if idx + 1 >= n: break
             
             v = (args[idx+1] << 32) | (args[idx] & 0xFFFFFFFF)
-            if t[1] == 'l' and v >> 63: v -= 1 << 64
+            if c == 'l' and v >> 63: v -= 1 << 64
             
             result.append(v)
             idx += 2
-        elif t[1] == 's' or t[1] == 'o': # jstring, jobject
+        elif c == 'o': # jstring, jobject, ...
             ref = get_ref(args[idx])
             result.append(JAVA_NULL if ref is None else ref.value)
             idx += 1
@@ -53,8 +79,8 @@ def read_args64(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> Li
         t = args_type_list[i]
         v = args[i]
         
-        # 's' - jstring, 'o' - jobject.
-        if t[1] == 's' or t[1] == 'o':
+        # references: jstring, jobject, ...
+        if _arg_kind(t) == 'o':
             ref = get_ref(v)
             result.append(JAVA_NULL if ref is None else ref.value)
         else:
@@ -71,13 +97,13 @@ def read_args_v32(jni: 'JNIEnv', mu: 'Uc', args_ptr, args_type_list) -> List:
     read = mu.mem_read
 
     for t in args_type_list:
-        c = t[1]
+        c = _arg_kind(t)
         if c == 'l' or c == 'd': # jlong, jdouble
             p += p & 4
             v = struct.unpack('<q' if c == 'l' else '<Q', read(p, 8))[0]
             res.append(v)
             p += 8
-        elif c == 's' or c == 'o': # jstring, jobject
+        elif c == 'o': # jstring, jobject, ...
             v = struct.unpack('<I', read(p, 4))[0]
             ref = get_ref(v)
             res.append(JAVA_NULL if ref is None else ref.value)
@@ -99,7 +125,7 @@ def read_args_v64(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) 
     get_ref = jni.get_reference
 
     for t in args_type_list:
-        c = t[1]
+        c = _arg_kind(t)
         # jdouble (d) jfloat (f) using VR
         if c == 'd' or c == 'f':
             if vr_o >= 0:
@@ -122,7 +148,7 @@ def read_args_v64(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) 
             
             v = struct.unpack("<Q", read(addr, 8))[0]
             
-            if c == 's' or c == 'o': # jstring, jobject
+            if c == 'o': # jstring, jobject, ...
                 if v == 0:
                     res.append(JAVA_NULL)
                 else:
