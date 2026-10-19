@@ -13,7 +13,8 @@ from ..reference_table import ReferenceTable
 from ...native.helpers.jni_native import (
     read_args32, read_args64,
     read_args_v32, read_args_v64,
-    read_args_a32, read_args_a64
+    read_args_a32, read_args_a64,
+    count_arg_words32
 )
 from ...native.helpers.method import native_method
 from ..class_def import JavaClassDef
@@ -160,8 +161,8 @@ class JNIEnv:
             name = getattr(clazz, 'jvm_name', str(clazz))
             raise RuntimeError(f"Could not find method {method_id} in {name} by id.")
 
-        n_args = len(method.args_list) if method.args_list else 0
-        raw_call_args = regs.read_args(3 + n_args)[3:]
+        n_words = self.__arg_words(emu, method.args_list, first_reg=3)
+        raw_call_args = regs.read_args(3 + n_words)[3:]
         call_args = self.__read_args_common(emu, raw_call_args, method.args_list, arg_type=0)
 
         if is_static:
@@ -175,6 +176,15 @@ class JNIEnv:
         if v is not None and not isinstance(v, (int, float, bool)):
             return self.add_local_reference(jobject(v))
         return v
+
+    @staticmethod
+    def __arg_words(emu: "Emulator", args_list, first_reg: int) -> int:
+        """Number of argument words to fetch for the variadic arguments of a Call<T>Method."""
+        if not args_list:
+            return 0
+        if emu.arch == emu_const.ARCH_ARM64:
+            return len(args_list)  # every argument takes one register / stack slot
+        return count_arg_words32(args_list, first_reg)
 
     # ret_kind is "J" (long), "F" (float), "D" (double) or "" for everything else: those three
     # are not returned like an int, see __wide_or_fp_return

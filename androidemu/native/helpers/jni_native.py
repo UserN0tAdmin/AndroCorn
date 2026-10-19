@@ -39,6 +39,22 @@ def _arg_kind(t: str) -> str:
     return c
 
 
+def count_arg_words32(args_type_list: List, first_reg: int = 3) -> int:
+    """
+    How many 32 bit words the (variadic) arguments occupy on ARM32, counted from the first one:
+    a jlong/jdouble takes two words and starts at an even register/stack position, so the word
+    before it may be left unused - exactly what read_args32 expects to find in its `args`.
+    `first_reg` is the register number of the first variadic argument (3 after env, obj, methodID).
+    """
+    idx = 0
+    for t in args_type_list or ():
+        if _arg_kind(t) in ('l', 'd'):
+            idx += (first_reg + idx) & 1
+            idx += 2
+        else:
+            idx += 1
+    return idx
+
 def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> List:
     if not args_type_list: return []
     
