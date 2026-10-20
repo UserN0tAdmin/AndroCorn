@@ -7,6 +7,11 @@ class Boolean(metaclass=JavaClassDef, jvm_name='java/lang/Boolean'):
         self.pyobject = value
     #
 
+    @java_method_def(name='<init>', args_list=["jboolean"], signature='(Z)V', native=False)
+    def ctor(self, emu, value):
+        self.pyobject = value
+    #
+
     @java_method_def(name='valueOf', args_list=["jboolean"], signature='(Z)Ljava/lang/Boolean;', native=False)
     def valueOf(emu, value):
         return Boolean(value)
@@ -115,6 +120,22 @@ class Float(metaclass=JavaClassDef, jvm_name='java/lang/Float'):
         self.pyobject = value
     #
 
+    @java_method_def(name='<init>', args_list=["jfloat"], signature='(F)V', native=False)
+    def ctor(self, emu, value):
+        self.pyobject = value
+    #
+
+    @staticmethod
+    @java_method_def(name='valueOf', args_list=["jfloat"], signature='(F)Ljava/lang/Float;', native=False)
+    def valueOf(emu, value):
+        return Float(value)
+    #
+
+    @java_method_def(name='floatValue', signature='()F', native=False)
+    def floatValue(self, emu):
+        return self.pyobject
+    #
+
     def __repr__(self):
         return "%r"%self.pyobject
     #
@@ -126,3 +147,138 @@ class Float(metaclass=JavaClassDef, jvm_name='java/lang/Float'):
     #
 #
 
+
+class Short(metaclass=JavaClassDef, jvm_name='java/lang/Short'):
+
+    def __init__(self, value=0):
+        self.pyobject = value
+    #
+
+    @java_method_def(name='<init>', args_list=["jshort"], signature='(S)V', native=False)
+    def ctor(self, emu, value):
+        self.pyobject = value
+    #
+
+    @staticmethod
+    @java_method_def(name='valueOf', args_list=["jshort"], signature='(S)Ljava/lang/Short;', native=False)
+    def valueOf(emu, value):
+        return Short(value)
+    #
+
+    @java_method_def(name='shortValue', signature='()S', native=False)
+    def shortValue(self, emu):
+        return self.pyobject
+    #
+
+    def __repr__(self):
+        return "%r"%self.pyobject
+    #
+
+    #TODO: 在继承多态机制完善后移动到Object类上
+    @java_method_def(name='getClass', signature='()Ljava/lang/Class;', native=False)
+    def getClass(self, emu):
+        return self.class_object
+    #
+#
+
+
+class Byte(metaclass=JavaClassDef, jvm_name='java/lang/Byte'):
+
+    def __init__(self, value=0):
+        self.pyobject = value
+    #
+
+    @java_method_def(name='<init>', args_list=["jbyte"], signature='(B)V', native=False)
+    def ctor(self, emu, value):
+        self.pyobject = value
+    #
+
+    @staticmethod
+    @java_method_def(name='valueOf', args_list=["jbyte"], signature='(B)Ljava/lang/Byte;', native=False)
+    def valueOf(emu, value):
+        return Byte(value)
+    #
+
+    @java_method_def(name='byteValue', signature='()B', native=False)
+    def byteValue(self, emu):
+        return self.pyobject
+    #
+
+    def __repr__(self):
+        return "%r"%self.pyobject
+    #
+
+    #TODO: 在继承多态机制完善后移动到Object类上
+    @java_method_def(name='getClass', signature='()Ljava/lang/Class;', native=False)
+    def getClass(self, emu):
+        return self.class_object
+    #
+#
+
+
+class Character(metaclass=JavaClassDef, jvm_name='java/lang/Character'):
+
+    def __init__(self, value=0):
+        self.pyobject = value
+    #
+
+    @java_method_def(name='<init>', args_list=["jchar"], signature='(C)V', native=False)
+    def ctor(self, emu, value):
+        self.pyobject = value
+    #
+
+    @staticmethod
+    @java_method_def(name='valueOf', args_list=["jchar"], signature='(C)Ljava/lang/Character;', native=False)
+    def valueOf(emu, value):
+        return Character(value)
+    #
+
+    @java_method_def(name='charValue', signature='()C', native=False)
+    def charValue(self, emu):
+        return self.pyobject
+    #
+
+    def __repr__(self):
+        return "%r"%self.pyobject
+    #
+
+    #TODO: 在继承多态机制完善后移动到Object类上
+    @java_method_def(name='getClass', signature='()Ljava/lang/Class;', native=False)
+    def getClass(self, emu):
+        return self.class_object
+    #
+#
+
+
+class Double(metaclass=JavaClassDef, jvm_name='java/lang/Double'):
+
+    def __init__(self, value=0.0):
+        self.pyobject = value
+    #
+
+    @java_method_def(name='<init>', args_list=["jdouble"], signature='(D)V', native=False)
+    def ctor(self, emu, value):
+        self.pyobject = value
+    #
+
+    @staticmethod
+    @java_method_def(name='valueOf', args_list=["jdouble"], signature='(D)Ljava/lang/Double;', native=False)
+    def valueOf(emu, value):
+        return Double(value)
+    #
+
+    @java_method_def(name='doubleValue', signature='()D', native=False)
+    def doubleValue(self, emu):
+        return self.pyobject
+    #
+
+    def __repr__(self):
+        return "%r"%self.pyobject
+    #
+
+    #TODO: 在继承多态机制完善后移动到Object类上
+    @java_method_def(name='getClass', signature='()Ljava/lang/Class;', native=False)
+    def getClass(self, emu):
+        return self.class_object
+    #
+#
