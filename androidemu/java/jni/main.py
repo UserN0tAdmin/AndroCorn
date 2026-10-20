@@ -30,6 +30,12 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _jint(v: int) -> int:
+    """A jint / jsize argument as a signed 32 bit number (the upper register bits are not meaningful)."""
+    v &= 0xFFFFFFFF
+    return v - (1 << 32) if v & 0x80000000 else v
+
+
 def _allocate_py_instance(pyclazz: JavaClassDef):
     """
     Creates the Python object behind a Java instance WITHOUT running any Java constructor.
@@ -1209,8 +1215,25 @@ class JNIEnv:
 
     @native_method
     def set_byte_array_region(self, emu: "Emulator", env, arrayJREF, startIndex, length, bufAddress):
-        string = helpers.read_byte_array(emu.mu, bufAddress, length)
-        self.set_local_reference(arrayJREF, jobject(self._array(string)))
+        # Copies buf into array[start:start+length] IN PLACE (like release_byte_array_elements does):
+        # the Java object stays the same one for everybody who holds it, and the rest of the array
+        # is kept. It used to replace the whole array by a new one made of the region only.
+        pyobj = self.jobject_to_pyobject(self.get_reference(arrayJREF))
+        items = pyobj.get_py_items()
+        start, length = _jint(startIndex), _jint(length)
+        if start < 0 or length < 0 or start + length > len(items):
+            raise IndexError(
+                f"ArrayIndexOutOfBoundsException: SetByteArrayRegion(start={start}, length={length}) "
+                f"on an array of length {len(items)}"
+            )
+        if length == 0:
+            return
+
+        data = helpers.read_byte_array(emu.mu, bufAddress, length)
+        if isinstance(items, (bytes, tuple)): # immutable backing store: swap it, keep the Java object
+            items = bytearray(items)
+            pyobj.pyobject = items
+        items[start:start + length] = data
 
     @native_method
     def set_char_array_region(self, emu: "Emulator", env): raise NotImplementedError()
