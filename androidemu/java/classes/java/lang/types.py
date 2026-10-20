@@ -1,7 +1,13 @@
 from androidemu.java.class_def import JavaClassDef
+from androidemu.java.field_def import JavaFieldDef
 from androidemu.java.method_def import java_method_def
+from .clazz import Class
 
-class Boolean(metaclass=JavaClassDef, jvm_name='java/lang/Boolean'):
+# Every box class has a static field TYPE: the Class object of the primitive it boxes (Integer.TYPE is int.class)
+def _type_field(descriptor: str) -> JavaFieldDef:
+    return JavaFieldDef('TYPE', 'Ljava/lang/Class;', True, Class.primitive(descriptor))
+
+class Boolean(metaclass=JavaClassDef, jvm_name='java/lang/Boolean', jvm_fields=[_type_field('Z')]):
     
     def __init__(self, value=False):
         self.pyobject = value
@@ -35,7 +41,7 @@ class Boolean(metaclass=JavaClassDef, jvm_name='java/lang/Boolean'):
 #
 
 
-class Integer(metaclass=JavaClassDef, jvm_name='java/lang/Integer'):
+class Integer(metaclass=JavaClassDef, jvm_name='java/lang/Integer', jvm_fields=[_type_field('I')]):
     _INTEGER_CACHE = {}
     
     def __init__(self, value=0):
@@ -76,7 +82,7 @@ class Integer(metaclass=JavaClassDef, jvm_name='java/lang/Integer'):
 
         return Integer(value)
 
-class Long(metaclass=JavaClassDef, jvm_name='java/lang/Long'):
+class Long(metaclass=JavaClassDef, jvm_name='java/lang/Long', jvm_fields=[_type_field('J')]):
     
     def __init__(self, value=0):
         self.pyobject = value
@@ -114,7 +120,7 @@ class Long(metaclass=JavaClassDef, jvm_name='java/lang/Long'):
 
 
 
-class Float(metaclass=JavaClassDef, jvm_name='java/lang/Float'):
+class Float(metaclass=JavaClassDef, jvm_name='java/lang/Float', jvm_fields=[_type_field('F')]):
     
     def __init__(self, value=0.0):
         self.pyobject = value
@@ -148,7 +154,7 @@ class Float(metaclass=JavaClassDef, jvm_name='java/lang/Float'):
 #
 
 
-class Short(metaclass=JavaClassDef, jvm_name='java/lang/Short'):
+class Short(metaclass=JavaClassDef, jvm_name='java/lang/Short', jvm_fields=[_type_field('S')]):
 
     def __init__(self, value=0):
         self.pyobject = value
@@ -182,7 +188,7 @@ class Short(metaclass=JavaClassDef, jvm_name='java/lang/Short'):
 #
 
 
-class Byte(metaclass=JavaClassDef, jvm_name='java/lang/Byte'):
+class Byte(metaclass=JavaClassDef, jvm_name='java/lang/Byte', jvm_fields=[_type_field('B')]):
 
     def __init__(self, value=0):
         self.pyobject = value
@@ -216,7 +222,7 @@ class Byte(metaclass=JavaClassDef, jvm_name='java/lang/Byte'):
 #
 
 
-class Character(metaclass=JavaClassDef, jvm_name='java/lang/Character'):
+class Character(metaclass=JavaClassDef, jvm_name='java/lang/Character', jvm_fields=[_type_field('C')]):
 
     def __init__(self, value=0):
         self.pyobject = value
@@ -250,7 +256,7 @@ class Character(metaclass=JavaClassDef, jvm_name='java/lang/Character'):
 #
 
 
-class Double(metaclass=JavaClassDef, jvm_name='java/lang/Double'):
+class Double(metaclass=JavaClassDef, jvm_name='java/lang/Double', jvm_fields=[_type_field('D')]):
 
     def __init__(self, value=0.0):
         self.pyobject = value
