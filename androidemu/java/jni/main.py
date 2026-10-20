@@ -81,9 +81,9 @@ class JNIEnv:
     # 1. INTERNAL HELPERS & CALL DISPATCHER
     # =========================================================================
 
-    def __read_args_common(self, emu: "Emulator", args, args_type_list, arg_type: int) -> List:
+    def __read_args_common(self, emu: "Emulator", args, args_type_list, arg_type: int, first_reg: int = 3) -> List:
         if arg_type == 0:
-            return self.__read_args(self, emu.mu, args, args_type_list)
+            return self.__read_args(self, emu.mu, args, args_type_list, first_reg)
         elif arg_type == 1:
             return self.__read_args_v(self, emu.mu, args, args_type_list)
         elif arg_type == 2:
@@ -139,36 +139,45 @@ class JNIEnv:
             raise ValueError("Expected a jobject.")
         self._globals.remove(obj)
 
-    def __dyncall(self, emu: "Emulator", is_static: bool, ret_kind: str = ""):
+    def __dyncall(self, emu: "Emulator", is_static: bool, ret_kind: str = "", nonvirtual: bool = False):
         regs = emu.registers
-        obj_or_cls_idx = regs.v_reg_1
-        method_id = regs.v_reg_2
 
-        target_ref = self.get_reference(obj_or_cls_idx)
-        if not target_ref:
-            raise RuntimeError(f"JNI CallMethod: invalid object/class ref {obj_or_cls_idx:#x}")
-
-        pyobj_or_cls: 'Class' = self.jobject_to_pyobject(target_ref)
-        if is_static:
-            clazz = pyobj_or_cls.get_py_clazz()
-            target_instance = None
+        if nonvirtual:
+            # CallNonvirtual<T>Method(env, obj, clazz, methodID, ...): the variadic arguments start
+            # one register later than in Call<T>Method(env, obj, methodID, ...)
+            first_reg = 4
+            target_instance, method, real_method = self.__resolve_instance_method(
+                regs.v_reg_1, regs.v_reg_3, clazz_idx=regs.v_reg_2)
         else:
-            target_instance = pyobj_or_cls
-            clazz = target_instance.__class__
+            first_reg = 3
+            obj_or_cls_idx = regs.v_reg_1
+            method_id = regs.v_reg_2
 
-        method = clazz.find_method_by_id(method_id)
-        if method is None:
-            name = getattr(clazz, 'jvm_name', str(clazz))
-            raise RuntimeError(f"Could not find method {method_id} in {name} by id.")
+            target_ref = self.get_reference(obj_or_cls_idx)
+            if not target_ref:
+                raise RuntimeError(f"JNI CallMethod: invalid object/class ref {obj_or_cls_idx:#x}")
 
-        n_words = self.__arg_words(emu, method.args_list, first_reg=3)
-        raw_call_args = regs.read_args(3 + n_words)[3:]
-        call_args = self.__read_args_common(emu, raw_call_args, method.args_list, arg_type=0)
+            pyobj_or_cls: 'Class' = self.jobject_to_pyobject(target_ref)
+            if is_static:
+                clazz = pyobj_or_cls.get_py_clazz()
+                target_instance = None
+            else:
+                target_instance = pyobj_or_cls
+                clazz = target_instance.__class__
+
+            method = clazz.find_method_by_id(method_id)
+            if method is None:
+                name = getattr(clazz, 'jvm_name', str(clazz))
+                raise RuntimeError(f"Could not find method {method_id} in {name} by id.")
+            real_method = None if is_static else clazz.find_method(method.name, method.signature)
+
+        n_words = self.__arg_words(emu, method.args_list, first_reg=first_reg)
+        raw_call_args = regs.read_args(first_reg + n_words)[first_reg:]
+        call_args = self.__read_args_common(emu, raw_call_args, method.args_list, arg_type=0, first_reg=first_reg)
 
         if is_static:
             v = method.func(emu, *call_args)
         else:
-            real_method = clazz.find_method(method.name, method.signature)
             v = real_method.func(target_instance, emu, *call_args)
 
         if ret_kind in _WIDE_OR_FP_KINDS:
@@ -176,6 +185,43 @@ class JNIEnv:
         if v is not None and not isinstance(v, (int, float, bool)):
             return self.add_local_reference(jobject(v))
         return v
+
+    def __resolve_instance_method(self, obj_idx: int, method_id: int, clazz_idx: Optional[int] = None):
+        """
+        Finds what an instance Call<T>Method / CallNonvirtual<T>Method has to run.
+        Returns (pyobj, method, real_method): `method` (found by id) provides the argument types,
+        `real_method` is the implementation to call.
+
+          * virtual call (clazz_idx is None): the id is looked up in the object's class and the
+            method is then looked up again by name, so an override in the object's own class wins
+            over the one the id was taken from;
+          * nonvirtual call (clazz_idx is the `clazz` argument): the id is looked up in that class
+            (or its superclasses) and exactly that implementation is run on the object, whatever
+            the class of the object is - this is how a constructor is called after AllocObject and
+            how an overridden super method is called.
+        """
+        obj = self.get_reference(obj_idx)
+        if not isinstance(obj, jobject):
+            raise ValueError("Expected a jobject.")
+
+        pyobj = self.jobject_to_pyobject(obj)
+
+        if clazz_idx is None:
+            clazz: "JavaClassDef" = pyobj.__class__
+            method = clazz.find_method_by_id(method_id)
+            if method is None:
+                raise RuntimeError(f"Could not find method {method_id} in object by id.")
+            return pyobj, method, clazz.find_method(method.name, method.signature) or method
+
+        jclazz = self.get_reference(clazz_idx)
+        if not isinstance(jclazz, jclass):
+            raise ValueError("Expected a jclass.")
+        pyclazz = jclazz.value.get_py_clazz()
+
+        method = pyclazz.find_method_by_id(method_id)
+        if method is None:
+            raise RuntimeError(f"Could not find method {method_id} in class {pyclazz.jvm_name} by id.")
+        return pyobj, method, method
 
     @staticmethod
     def __arg_words(emu: "Emulator", args_list, first_reg: int) -> int:
@@ -188,29 +234,19 @@ class JNIEnv:
 
     # ret_kind is "J" (long), "F" (float), "D" (double) or "" for everything else: those three
     # are not returned like an int, see __wide_or_fp_return
-    def __dispatch_call(self, emu: "Emulator", is_static: bool, ret_kind: str = ""):
-        res = self.__dyncall(emu, is_static, ret_kind)
+    def __dispatch_call(self, emu: "Emulator", is_static: bool, ret_kind: str = "", nonvirtual: bool = False):
+        res = self.__dyncall(emu, is_static, ret_kind, nonvirtual)
         if res is not None:
             if isinstance(res, tuple):
                 emu.registers.v_reg_0, emu.registers.v_reg_1 = res
             else:
                 emu.registers.v_reg_0 = res
 
-    def __call_varargs_method(self, emu: "Emulator", env, obj_idx: int, method_id: int, args_v, ret_kind: str = ""):
-        obj = self.get_reference(obj_idx)
-        if not isinstance(obj, jobject):
-            raise ValueError("Expected a jobject.")
-
-        pyobj = self.jobject_to_pyobject(obj)
-
-        clazz: "JavaClassDef" = pyobj.__class__
-
-        method = clazz.find_method_by_id(method_id)
-        if method is None:
-            raise RuntimeError(f"Could not find method {method_id} in object by id.")
+    def __call_varargs_method(self, emu: "Emulator", env, obj_idx: int, method_id: int, args_v, ret_kind: str = "",
+                              clazz_idx: Optional[int] = None):
+        pyobj, method, real_method = self.__resolve_instance_method(obj_idx, method_id, clazz_idx)
 
         constructor_args = self.__read_args_common(emu, args_v, method.args_list, arg_type=1)
-        real_method = clazz.find_method(method.name, method.signature)
         v = real_method.func(pyobj, emu, *constructor_args)
 
         if ret_kind in _WIDE_OR_FP_KINDS:
@@ -241,22 +277,11 @@ class JNIEnv:
     # ret_kind is the JNI return type letter of the function the native code actually called
     # (Z B C S I J F D L V), NOT the declared one of the mocked method: it decides in which
     # register(s) and in which width the result is handed back to the native caller.
-    def __call_a_method(self, emu: "Emulator", obj_idx: int, method_id: int, args_a: int, ret_kind: str):
-        obj = self.get_reference(obj_idx)
-        if not isinstance(obj, jobject):
-            raise ValueError("Expected a jobject.")
-
-        pyobj = self.jobject_to_pyobject(obj)
-        clazz: "JavaClassDef" = pyobj.__class__
-
-        method = clazz.find_method_by_id(method_id)
-        if method is None:
-            raise RuntimeError(f"Could not find method {method_id} in object by id.")
+    def __call_a_method(self, emu: "Emulator", obj_idx: int, method_id: int, args_a: int, ret_kind: str,
+                        clazz_idx: Optional[int] = None):
+        pyobj, method, real_method = self.__resolve_instance_method(obj_idx, method_id, clazz_idx)
 
         call_args = self.__read_args_common(emu, args_a, method.args_list, arg_type=2)
-        # look the method up again by name: an override in the object's own class wins over the
-        # one the method id was taken from (virtual dispatch)
-        real_method = clazz.find_method(method.name, method.signature) or method
         v = real_method.func(pyobj, emu, *call_args)
         return self.__a_return(emu, v, ret_kind)
 
@@ -781,67 +806,98 @@ class JNIEnv:
     def call_static_void_method_a(self, emu: "Emulator", env, clazz_idx, method_id, args):
         self.__call_static_a_method(emu, clazz_idx, method_id, args, "V")
 
-    # Nonvirtual stubs
+    # CallNonvirtual<T>Method*(env, obj, clazz, methodID, ...): run the implementation that `clazz`
+    # provides for `methodID` on `obj` (no virtual dispatch), see __resolve_instance_method
+    def call_nonvirtual_object_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+    def call_nonvirtual_boolean_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+    def call_nonvirtual_byte_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+    def call_nonvirtual_char_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+    def call_nonvirtual_short_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+    def call_nonvirtual_int_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+    def call_nonvirtual_long_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, ret_kind="J", nonvirtual=True)
+    def call_nonvirtual_float_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, ret_kind="F", nonvirtual=True)
+    def call_nonvirtual_double_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, ret_kind="D", nonvirtual=True)
+    def call_nonvirtual_void_method(self, emu: "Emulator"): self.__dispatch_call(emu, is_static=False, nonvirtual=True)
+
     @native_method
-    def call_nonvirtual_object_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_object_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_object_method_v(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_boolean_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_object_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_byte_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_boolean_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_char_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_boolean_method_v(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_short_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_boolean_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_int_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_byte_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_long_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, "J", clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_byte_method_v(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_float_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, "F", clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_byte_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_double_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_varargs_method(emu, env, obj_idx, method_id, args, "D", clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_char_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_void_method_v(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        self.__call_varargs_method(emu, env, obj_idx, method_id, args, clazz_idx=clazz_idx)
+
     @native_method
-    def call_nonvirtual_char_method_v(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_object_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "L", clazz_idx)
+
     @native_method
-    def call_nonvirtual_char_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_boolean_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "Z", clazz_idx)
+
     @native_method
-    def call_nonvirtual_short_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_byte_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "B", clazz_idx)
+
     @native_method
-    def call_nonvirtual_short_method_v(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_char_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "C", clazz_idx)
+
     @native_method
-    def call_nonvirtual_short_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_short_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "S", clazz_idx)
+
     @native_method
-    def call_nonvirtual_int_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_int_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "I", clazz_idx)
+
     @native_method
-    def call_nonvirtual_int_method_v(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_long_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "J", clazz_idx)
+
     @native_method
-    def call_nonvirtual_int_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_float_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "F", clazz_idx)
+
     @native_method
-    def call_nonvirtual_long_method(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_double_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        return self.__call_a_method(emu, obj_idx, method_id, args, "D", clazz_idx)
+
     @native_method
-    def call_nonvirtual_long_method_v(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_long_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_float_method(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_float_method_v(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_float_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_double_method(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_double_method_v(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_double_method_a(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_void_method(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_void_method_v(self, emu: "Emulator", env): raise NotImplementedError()
-    @native_method
-    def call_nonvirtual_void_method_a(self, emu: "Emulator", env): raise NotImplementedError()
+    def call_nonvirtual_void_method_a(self, emu: "Emulator", env, obj_idx, clazz_idx, method_id, args):
+        self.__call_a_method(emu, obj_idx, method_id, args, "V", clazz_idx)
 
     # =========================================================================
     # 5. FIELD ACCESS (INSTANCE & STATIC)

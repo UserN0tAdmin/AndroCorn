@@ -55,7 +55,8 @@ def count_arg_words32(args_type_list: List, first_reg: int = 3) -> int:
             idx += 1
     return idx
 
-def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> List:
+def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first_reg: int = 3) -> List:
+    # first_reg: register number of args[0] (3 after env, obj, methodID; 4 after env, obj, clazz, methodID)
     if not args_type_list: return []
     
     result = []
@@ -68,7 +69,7 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> Li
         
         c = _arg_kind(t)
         if c == 'l' or c == 'd': # jlong, jdouble
-            idx += (3 + idx) & 1
+            idx += (first_reg + idx) & 1
             if idx + 1 >= n: break
             
             v = (args[idx+1] << 32) | (args[idx] & 0xFFFFFFFF)
@@ -86,7 +87,7 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> Li
             
     return result
 
-def read_args64(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List) -> List:
+def read_args64(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first_reg: int = 3) -> List:
     if not args_type_list: return []
 
     result = []
