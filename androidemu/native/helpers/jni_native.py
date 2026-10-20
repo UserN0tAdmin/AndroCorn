@@ -5,6 +5,11 @@ from ...java.jni.reference import *
 from ...java.jni.constants import *
 from ...java.jvm.constants import JAVA_NULL
 
+from unicorn.arm64_const import (
+    UC_ARM64_REG_Q0, UC_ARM64_REG_Q1, UC_ARM64_REG_Q2, UC_ARM64_REG_Q3,
+    UC_ARM64_REG_Q4, UC_ARM64_REG_Q5, UC_ARM64_REG_Q6, UC_ARM64_REG_Q7,
+)
+
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
@@ -12,6 +17,19 @@ if TYPE_CHECKING:
     from unicorn import Uc
 
 # JNIEnv tools
+
+# jfloat / jdouble in the "..." and va_list forms.
+#
+# C promotes a float to double when it is passed through "...", so BOTH jfloat and jdouble arrive as a
+# 64 bit IEEE double there (8 bytes in a va_list / on the stack, two words in ARM32 registers - softfp -,
+# a vector register on AArch64). The mocks get a Python float, as JavaClassDef documents.
+_FP_ARG_REGS64 = (
+    UC_ARM64_REG_Q0, UC_ARM64_REG_Q1, UC_ARM64_REG_Q2, UC_ARM64_REG_Q3,
+    UC_ARM64_REG_Q4, UC_ARM64_REG_Q5, UC_ARM64_REG_Q6, UC_ARM64_REG_Q7,
+)
+
+def _double_from_bits(bits: int) -> float:
+    return struct.unpack('<d', struct.pack('<Q', bits & 0xFFFFFFFFFFFFFFFF))[0]
 
 # JNI type names that hold a reference (resolved through the JNIEnv reference tables).
 _REF_TYPE_NAMES = frozenset(('jobject', 'jstring', 'jclass', 'jthrowable', 'jarray', 'jweak'))
@@ -42,13 +60,14 @@ def _arg_kind(t: str) -> str:
 def count_arg_words32(args_type_list: List, first_reg: int = 3) -> int:
     """
     How many 32 bit words the (variadic) arguments occupy on ARM32, counted from the first one:
-    a jlong/jdouble takes two words and starts at an even register/stack position, so the word
+    a jlong/jdouble (and a jfloat, which is promoted to double) takes two words and starts at an
+    even register/stack position, so the word
     before it may be left unused - exactly what read_args32 expects to find in its `args`.
     `first_reg` is the register number of the first variadic argument (3 after env, obj, methodID).
     """
     idx = 0
     for t in args_type_list or ():
-        if _arg_kind(t) in ('l', 'd'):
+        if _arg_kind(t) in ('l', 'd', 'f'):
             idx += (first_reg + idx) & 1
             idx += 2
         else:
@@ -68,12 +87,15 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first
         if idx >= n: break
         
         c = _arg_kind(t)
-        if c == 'l' or c == 'd': # jlong, jdouble
+        if c == 'l' or c == 'd' or c == 'f': # jlong, jdouble, jfloat (promoted to double)
             idx += (first_reg + idx) & 1
             if idx + 1 >= n: break
             
             v = (args[idx+1] << 32) | (args[idx] & 0xFFFFFFFF)
-            if c == 'l' and v >> 63: v -= 1 << 64
+            if c == 'l':
+                if v >> 63: v -= 1 << 64
+            else:
+                v = _double_from_bits(v)
             
             result.append(v)
             idx += 2
@@ -87,22 +109,40 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first
             
     return result
 
+def count_arg_words64(args_type_list: List) -> int:
+    """How many integer registers / stack slots the (variadic) arguments need on ARM64: floating point ones use vector registers."""
+    return sum(1 for t in args_type_list or () if _arg_kind(t) not in ('d', 'f'))
+
 def read_args64(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first_reg: int = 3) -> List:
+    # args: the integer argument registers (and then the stack) after the fixed arguments.
+    # AAPCS64 numbers the integer and the vector registers separately: the n-th jdouble/jfloat is in
+    # v<n> whatever integer arguments are around it, the other arguments take args[0], args[1], ...
     if not args_type_list: return []
 
     result = []
     get_ref = jni.get_reference
-    for i in range(len(args_type_list) if len(args_type_list) < len(args) else len(args)):
-        t = args_type_list[i]
-        v = args[i]
-        
+    gp = 0
+    fp = 0
+    for t in args_type_list:
+        c = _arg_kind(t)
+        if c == 'd' or c == 'f':
+            if fp >= len(_FP_ARG_REGS64):
+                raise NotImplementedError("more than 8 jfloat/jdouble arguments in a variadic Call<T>Method")
+            result.append(_double_from_bits(mu.reg_read(_FP_ARG_REGS64[fp])))
+            fp += 1
+            continue
+
+        if gp >= len(args): break
+        v = args[gp]
+        gp += 1
+
         # references: jstring, jobject, ...
-        if _arg_kind(t) == 'o':
+        if c == 'o':
             ref = get_ref(v)
             result.append(JAVA_NULL if ref is None else ref.value)
         else:
             result.append(v)
-            
+
     return result
 
 def read_args_v32(jni: 'JNIEnv', mu: 'Uc', args_ptr, args_type_list) -> List:
@@ -115,9 +155,9 @@ def read_args_v32(jni: 'JNIEnv', mu: 'Uc', args_ptr, args_type_list) -> List:
 
     for t in args_type_list:
         c = _arg_kind(t)
-        if c == 'l' or c == 'd': # jlong, jdouble
+        if c == 'l' or c == 'd' or c == 'f': # jlong, jdouble, jfloat (promoted to double)
             p += p & 4
-            v = struct.unpack('<q' if c == 'l' else '<Q', read(p, 8))[0]
+            v = struct.unpack('<q' if c == 'l' else '<d', read(p, 8))[0]
             res.append(v)
             p += 8
         elif c == 'o': # jstring, jobject, ...
@@ -152,7 +192,7 @@ def read_args_v64(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) 
                 addr = vr_t + vr_o
                 vr_o += 16 # VR args in AAPCS64 using 16 bytes (Q-reg)
             
-            v = struct.unpack("<Q", read(addr, 8))[0]
+            v = struct.unpack("<d", read(addr, 8))[0]
             res.append(v)
         else:
             # (int, long, object, etc)

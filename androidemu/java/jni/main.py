@@ -14,7 +14,7 @@ from ...native.helpers.jni_native import (
     read_args32, read_args64,
     read_args_v32, read_args_v64,
     read_args_a32, read_args_a64,
-    count_arg_words32
+    count_arg_words32, count_arg_words64
 )
 from ...native.helpers.method import native_method
 from ..class_def import JavaClassDef
@@ -229,7 +229,7 @@ class JNIEnv:
         if not args_list:
             return 0
         if emu.arch == emu_const.ARCH_ARM64:
-            return len(args_list)  # every argument takes one register / stack slot
+            return count_arg_words64(args_list)  # jfloat/jdouble are in vector registers
         return count_arg_words32(args_list, first_reg)
 
     # ret_kind is "J" (long), "F" (float), "D" (double) or "" for everything else: those three
