@@ -1,3 +1,4 @@
+import inspect
 import logging
 import struct
 from typing import TYPE_CHECKING, List, Optional
@@ -26,6 +27,37 @@ if TYPE_CHECKING:
     from ...utils.hooker import Hooker
 
 logger = logging.getLogger(__name__)
+
+
+def _allocate_py_instance(pyclazz: JavaClassDef):
+    """
+    Creates the Python object behind a Java instance WITHOUT running any Java constructor.
+
+    ``NewObject*`` does ``pyclazz()`` and then calls the mocked ``<init>``. ``AllocObject``
+    must do only the first half (JNI spec: the object is allocated "without invoking any of
+    the object's constructors"), so the mocked ``<init>`` is never touched here - native code
+    runs it later itself (``CallNonvirtual<Void>Method*`` / ``Call<Void>Method*``).
+
+    The Python-level ``__init__`` is the mock's default-state initializer, not a Java
+    constructor, so it is still run when it can be called without arguments (the same state
+    a ``NewObject`` instance has before ``<init>`` runs). Mocks whose ``__init__`` requires
+    arguments are allocated "raw" through ``__new__`` instead of failing.
+
+    The signature is inspected instead of catching ``TypeError`` so that a real ``TypeError``
+    raised inside a mock's ``__init__`` is not silently swallowed.
+    """
+    init = pyclazz.__init__
+    callable_without_args = init is object.__init__
+    if not callable_without_args:
+        try:
+            inspect.signature(init).bind(None)  # None stands for `self`
+            callable_without_args = True
+        except (TypeError, ValueError):  # required args are missing / no signature available
+            callable_without_args = False
+
+    if callable_without_args:
+        return pyclazz()
+    return pyclazz.__new__(pyclazz)
 
 
 class JNIEnv:
@@ -1200,7 +1232,12 @@ class JNIEnv:
     @native_method
     def new_object_a(self, emu: "Emulator", env): raise NotImplementedError()
     @native_method
-    def alloc_object(self, emu: "Emulator", env): raise NotImplementedError()
+    def alloc_object(self, emu: "Emulator", env, clazz_idx):
+        jclazz = self.get_reference(clazz_idx)
+        if not isinstance(jclazz, jclass):
+            raise ValueError("Expected a jclass.")
+        obj = _allocate_py_instance(jclazz.value.get_py_clazz())
+        return self.add_local_reference(jobject(obj))
 
     # Reflection Bridging
     @native_method
