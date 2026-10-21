@@ -35,6 +35,35 @@ def _double_from_bits(bits: int) -> float:
 _REF_TYPE_NAMES = frozenset(('jobject', 'jstring', 'jclass', 'jthrowable', 'jarray', 'jweak'))
 _INT_TYPE_NAMES = frozenset(('jboolean', 'jbyte', 'jchar', 'jshort', 'jint'))
 
+_SIGNED_INT_BITS = {
+    'jbyte': 8,
+    'jshort': 16,
+    'jint': 32,
+    'jlong': 64,
+}
+
+
+def _to_java_int(t: str, value: int) -> int:
+    """
+    Give an integer argument read from a register / the stack its Java value.
+
+    The C caller puts the JNI type's raw bits in the register: jbyte/jshort are promoted to int
+    for a variadic call, jint is 32 bit and jlong is 64 bit. Python has no fixed-width integers,
+    so the reader has to apply the width/sign itself. jchar is unsigned, jboolean is 0/1.
+    """
+    if t == 'jboolean':
+        return 1 if value & 0xFF else 0
+    if t == 'jchar':
+        return value & 0xFFFF
+
+    bits = _SIGNED_INT_BITS.get(t)
+    if bits is None:
+        return value
+    value &= (1 << bits) - 1
+    if value & (1 << (bits - 1)):
+        value -= 1 << bits
+    return value
+
 
 def _arg_kind(t: str) -> str:
     """
@@ -93,7 +122,7 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first
             
             v = (args[idx+1] << 32) | (args[idx] & 0xFFFFFFFF)
             if c == 'l':
-                if v >> 63: v -= 1 << 64
+                v = _to_java_int(t, v)
             else:
                 v = _double_from_bits(v)
             
@@ -104,7 +133,7 @@ def read_args32(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first
             result.append(JAVA_NULL if ref is None else ref.value)
             idx += 1
         else: # jint, jchar, jbyte, jboolean
-            result.append(args[idx])
+            result.append(_to_java_int(t, args[idx]))
             idx += 1
             
     return result
@@ -141,7 +170,7 @@ def read_args64(jni: 'JNIEnv', mu: 'Uc', args: List, args_type_list: List, first
             ref = get_ref(v)
             result.append(JAVA_NULL if ref is None else ref.value)
         else:
-            result.append(v)
+            result.append(_to_java_int(t, v))
 
     return result
 
@@ -158,7 +187,7 @@ def read_args_v32(jni: 'JNIEnv', mu: 'Uc', args_ptr, args_type_list) -> List:
         if c == 'l' or c == 'd' or c == 'f': # jlong, jdouble, jfloat (promoted to double)
             p += p & 4
             v = struct.unpack('<q' if c == 'l' else '<d', read(p, 8))[0]
-            res.append(v)
+            res.append(_to_java_int(t, v) if c == 'l' else v)
             p += 8
         elif c == 'o': # jstring, jobject, ...
             v = struct.unpack('<I', read(p, 4))[0]
@@ -166,7 +195,7 @@ def read_args_v32(jni: 'JNIEnv', mu: 'Uc', args_ptr, args_type_list) -> List:
             res.append(JAVA_NULL if ref is None else ref.value)
             p += 4
         else: # jint, jchar, jbyte, jboolean
-            res.append(struct.unpack('<I', read(p, 4))[0])
+            res.append(_to_java_int(t, struct.unpack('<I', read(p, 4))[0]))
             p += 4
             
     return res
@@ -212,7 +241,7 @@ def read_args_v64(jni: 'JNIEnv', mu: 'Uc', args_ptr: int, args_type_list: List) 
                     ref = get_ref(v)
                     res.append(JAVA_NULL if ref is None else ref.value)
             else:
-                res.append(v)
+                res.append(_to_java_int(t, v))
                 
     return res
 

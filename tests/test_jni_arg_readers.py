@@ -94,5 +94,67 @@ class TestReaders(unittest.TestCase):
         self.assertEqual(got, [0, 0x0123456789ABCDEF])
 
 
+class TestNarrowArguments(unittest.TestCase):
+    """Narrow JNI integers must reach the mocks with Java semantics, not raw register bits."""
+
+    def setUp(self):
+        self.h = Harness(emu_const.ARCH_ARM64)
+
+    def test_read_args32_narrow_types(self):
+        raw = [0xFFFFFFFB, 0xFFFFFFFE, 0xFFFFFFFF, 0x1FFFE, 2]
+        got = read_args32(
+            self.h.env, self.h.mu, raw,
+            ['jbyte', 'jshort', 'jint', 'jchar', 'jboolean'],
+        )
+        self.assertEqual(got, [-5, -2, -1, 0xFFFE, 1])
+
+    def test_read_args32_negative_long(self):
+        raw = [0, 0xFFFFFFFF, 0xFFFFFFFF]
+        self.assertEqual(
+            read_args32(self.h.env, self.h.mu, raw, ['jint', 'jlong']),
+            [0, -1],
+        )
+
+    def test_read_args64_narrow_types(self):
+        raw = [0xFFFFFFFB, 0xFFFFFFFE, 0xFFFFFFFF, 0x1FFFE, 2, 0xFFFFFFFFFFFFFFFE]
+        got = read_args64(
+            self.h.env, self.h.mu, raw,
+            ['jbyte', 'jshort', 'jint', 'jchar', 'jboolean', 'jlong'],
+        )
+        self.assertEqual(got, [-5, -2, -1, 0xFFFE, 1, -2])
+
+    def test_read_args_v32_narrow_types(self):
+        raw = [0xFFFFFFFB, 0xFFFFFFFE, 0xFFFFFFFF, 0x1FFFE, 2]
+        self.h.mu.mem_write(MEM_BASE, struct.pack("<5I", *raw))
+        got = read_args_v32(
+            self.h.env, self.h.mu, MEM_BASE,
+            ['jbyte', 'jshort', 'jint', 'jchar', 'jboolean'],
+        )
+        self.assertEqual(got, [-5, -2, -1, 0xFFFE, 1])
+
+    def test_read_args_v32_negative_long(self):
+        # 4 bytes of jint, 4 bytes of alignment padding, then the signed 64 bit jlong
+        self.h.mu.mem_write(MEM_BASE, struct.pack("<I4xq", 0, -2))
+        self.assertEqual(
+            read_args_v32(self.h.env, self.h.mu, MEM_BASE, ['jint', 'jlong']),
+            [0, -2],
+        )
+
+    def test_read_args_v64_narrow_types(self):
+        raw = [0xFFFFFFFB, 0xFFFFFFFE, 0xFFFFFFFF, 0x1FFFE, 2, 0xFFFFFFFFFFFFFFFE]
+        gr_top = MEM_BASE + 0x100
+        gr_offs = -8 * len(raw)
+        self.h.mu.mem_write(
+            MEM_BASE,
+            struct.pack("<QQQii", MEM_BASE + 0x200, gr_top, MEM_BASE + 0x180, gr_offs, 0),
+        )
+        self.h.mu.mem_write(gr_top + gr_offs, struct.pack("<6Q", *raw))
+        got = read_args_v64(
+            self.h.env, self.h.mu, MEM_BASE,
+            ['jbyte', 'jshort', 'jint', 'jchar', 'jboolean', 'jlong'],
+        )
+        self.assertEqual(got, [-5, -2, -1, 0xFFFE, 1, -2])
+
+
 if __name__ == "__main__":
     unittest.main()

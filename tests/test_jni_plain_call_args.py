@@ -25,6 +25,11 @@ class Target(metaclass=JavaClassDef, jvm_name='test/plain/Target'):
         Target.seen = (a, b, c)
 
     @staticmethod
+    @java_method_def(name='neg', args_list=['jbyte', 'jshort', 'jint', 'jlong'], signature='(BSIJ)V', native=False)
+    def neg(emu, b, s, i, j):
+        Target.seen = (b, s, i, j)
+
+    @staticmethod
     @java_method_def(name='jj', args_list=['jlong', 'jlong'], signature='(JJ)V', native=False)
     def jj(emu, a, b):
         Target.seen = (a, b)
@@ -76,6 +81,20 @@ class TestPlainVariadicArguments(unittest.TestCase):
         a, b = lo_hi(0x0102030405060708), lo_hi(-1)
         self.assertEqual(self.call(emu_const.ARCH_ARM32, 'jj', '(JJ)V', (0xDEAD, a[0], a[1], b[0], b[1])),
                          (0x0102030405060708, -1))
+
+    def test_negative_narrow_arguments(self):
+        lo, hi = lo_hi(-2)
+        # r3 = jbyte, then jshort/jint and the even aligned jlong pair on the stack
+        self.assertEqual(
+            self.call(emu_const.ARCH_ARM32, 'neg', '(BSIJ)V',
+                      (0xFFFFFFFB, 0xFFFFFFFE, 0xFFFFFFFF, lo, hi)),
+            (-5, -2, -1, -2),
+        )
+        self.assertEqual(
+            self.call(emu_const.ARCH_ARM64, 'neg', '(BSIJ)V',
+                      (0xFFFFFFFB, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFE)),
+            (-5, -2, -1, -2),
+        )
 
     def test_arm32_ints_only_are_unchanged(self):
         self.assertEqual(self.call(emu_const.ARCH_ARM32, 'iii', '(IIIII)V', (1, 2, 3, 4, 5)), (1, 2, 3, 4, 5))
