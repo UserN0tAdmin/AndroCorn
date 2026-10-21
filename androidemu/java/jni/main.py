@@ -1242,6 +1242,44 @@ class JNIEnv:
         data = bytes(emu.mu.mem_read(buf_ptr, length * _PRIM_ELEMENT[kind][2]))
         _assign_region(pyobj, start, _unpack_elements(kind, data))
 
+    # Get<T>ArrayElements / Release<T>ArrayElements keep the buffer layout of the byte[] versions:
+    # an 8 byte header in front of the elements, so the pointer handed out is buf + 8 and free() gets elems - 8
+    def __get_prim_elements(self, emu: "Emulator", array_idx: int, is_copy_ptr: int, kind: str):
+        items = self.__prim_array(array_idx, kind, f"Get{_PRIM_NAME[kind]}ArrayElements").get_py_items()
+        data = _pack_elements(kind, items)
+        extra_n = 8
+
+        buf = self.__libc.malloc(extra_n + len(data))
+        emu.mu.mem_write(buf, len(items).to_bytes(4, "little"))
+        if data:
+            emu.mu.mem_write(buf + extra_n, data)
+        if is_copy_ptr != JAVA_NULL:  # the buffer is always a copy: tell the caller (a NULL isCopy is allowed)
+            emu.mu.mem_write(is_copy_ptr, bytes([JNI_TRUE]))
+        return buf + extra_n
+
+    def __release_prim_elements(self, emu: "Emulator", array_idx: int, elems: int, mode: int, kind: str):
+        if elems == JAVA_NULL:
+            return
+        pyobj = self.__prim_array(array_idx, kind, f"Release{_PRIM_NAME[kind]}ArrayElements")
+        mode = _jint(mode)
+        if mode in (0, JNI_COMMIT):  # copy the buffer back into the array, in place
+            count = len(pyobj.get_py_items())
+            if count:
+                data = bytes(emu.mu.mem_read(elems, count * _PRIM_ELEMENT[kind][2]))
+                _assign_region(pyobj, 0, _unpack_elements(kind, data))
+        if mode in (0, JNI_ABORT):  # free the buffer
+            self.__libc.free(elems - 8)
+
+    def __array_kind(self, array_idx: int) -> str:
+        """The JNI type letter of the elements of the array (for the type-less *PrimitiveArrayCritical functions)."""
+        pyobj = self.jobject_to_pyobject(self.get_reference(array_idx))
+        kind = getattr(pyobj, "jni_kind", None)
+        if kind is None and isinstance(pyobj.get_py_items(), (bytes, bytearray)):
+            kind = "B"
+        if kind is None:
+            raise ValueError(f"cannot tell the element type of {pyobj.jvm_name} (use one of the primitive array classes)")
+        return kind
+
     @native_method
     def get_array_length(self, emu: "Emulator", env, array):
         obj = self.get_reference(array)
@@ -1308,7 +1346,8 @@ class JNIEnv:
         return self.__new_prim_array("D", length)
 
     @native_method
-    def get_boolean_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_boolean_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "Z")
 
     @native_method
     def get_byte_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
@@ -1326,20 +1365,27 @@ class JNIEnv:
         return buf + extra_n
 
     @native_method
-    def get_char_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_char_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "C")
     @native_method
-    def get_short_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_short_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "S")
     @native_method
-    def get_int_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_int_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "I")
     @native_method
-    def get_long_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_long_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "J")
     @native_method
-    def get_float_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_float_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "F")
     @native_method
-    def get_double_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_double_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, "D")
 
     @native_method
-    def release_boolean_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_boolean_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "Z")
 
     @native_method
     def release_byte_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
@@ -1353,17 +1399,23 @@ class JNIEnv:
             self.__libc.free(elems - 8)
 
     @native_method
-    def release_char_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_char_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "C")
     @native_method
-    def release_short_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_short_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "S")
     @native_method
-    def release_int_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_int_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "I")
     @native_method
-    def release_long_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_long_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "J")
     @native_method
-    def release_float_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_float_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "F")
     @native_method
-    def release_double_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
+    def release_double_array_elements(self, emu: "Emulator", env, array_idx, elems, mode):
+        self.__release_prim_elements(emu, array_idx, elems, mode, "D")
 
     @native_method
     def get_boolean_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
@@ -1449,11 +1501,17 @@ class JNIEnv:
 
     @native_method
     def get_primitive_array_critical(self, emu: "Emulator", env, array_idx, is_copy_ptr):
-        return self.get_byte_array_elements(emu, env, array_idx, is_copy_ptr)
+        kind = self.__array_kind(array_idx)
+        if kind == "B":
+            return self.get_byte_array_elements(emu, env, array_idx, is_copy_ptr)
+        return self.__get_prim_elements(emu, array_idx, is_copy_ptr, kind)
 
     @native_method
     def release_primitive_array_critical(self, emu: "Emulator", env, array_idx, elems, mode):
-        return self.release_byte_array_elements(emu, env, array_idx, elems, mode)
+        kind = self.__array_kind(array_idx)
+        if kind == "B":
+            return self.release_byte_array_elements(emu, env, array_idx, elems, mode)
+        return self.__release_prim_elements(emu, array_idx, elems, mode, kind)
 
     # =========================================================================
     # 7. OBJECT LIFECYCLE, CLASSES & REFLECTION
