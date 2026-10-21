@@ -1,6 +1,7 @@
 import inspect
 import logging
 import struct
+from array import array as _pyarray
 from typing import TYPE_CHECKING, List, Optional
 
 from unicorn import *
@@ -29,6 +30,54 @@ if TYPE_CHECKING:
     from ...utils.hooker import Hooker
 
 logger = logging.getLogger(__name__)
+
+
+# Primitive arrays (everything but byte[], which keeps its bytearray code):
+# JNI type letter -> (struct format to read a native element, format to write it, bytes per element)
+_PRIM_ELEMENT = {
+    "Z": ("B", "B", 1), "C": ("H", "H", 2), "S": ("h", "H", 2), "I": ("i", "I", 4),
+    "J": ("q", "Q", 8), "F": ("f", "f", 4), "D": ("d", "d", 8),
+}
+_PRIM_NAME = {"Z": "Boolean", "C": "Char", "S": "Short", "I": "Int", "J": "Long", "F": "Float", "D": "Double"}
+
+
+def _pack_elements(kind: str, values) -> bytes:
+    """Python items -> the bytes of a native array. Integers are masked to their width, so signed and unsigned items both work."""
+    _, wfmt, size = _PRIM_ELEMENT[kind]
+    if kind == "Z":
+        values = [1 if v else 0 for v in values]
+    elif kind in "CSIJ":
+        mask = (1 << (8 * size)) - 1
+        values = [int(v) & mask for v in values]
+    else:
+        values = [float(v) for v in values]
+    try:
+        return struct.pack(f"<{len(values)}{wfmt}", *values)
+    except OverflowError:  # a float outside of the float32 range: +-inf, as a Java (float) cast gives
+        inf = float("inf")
+        return struct.pack(f"<{len(values)}f", *[v if abs(v) <= 3.4028234663852886e38 else (inf if v > 0 else -inf) for v in values])
+
+
+def _unpack_elements(kind: str, data: bytes) -> list:
+    """The bytes of a native array -> Python items with Java semantics (signed short/int/long, unsigned char, boolean 0/1)."""
+    rfmt, _, size = _PRIM_ELEMENT[kind]
+    values = list(struct.unpack(f"<{len(data) // size}{rfmt}", data))
+    if kind == "Z":
+        values = [1 if v else 0 for v in values]
+    return values
+
+
+def _assign_region(pyobj, start: int, values: list) -> None:
+    """array[start:start+len(values)] = values, IN PLACE, whatever the array keeps its items in."""
+    items = pyobj.get_py_items()
+    end = start + len(values)
+    if isinstance(items, _pyarray):
+        items[start:end] = _pyarray(items.typecode, values)
+        return
+    if isinstance(items, (bytes, tuple)):  # immutable backing store: swap it, keep the Java object
+        items = list(items)
+        pyobj.pyobject = items
+    items[start:end] = values
 
 
 def _jint(v: int) -> int:
@@ -1149,6 +1198,50 @@ class JNIEnv:
         return self.release_string_chars(emu, env, string, chars_ptr)
 
     # Array Operations
+    def __prim_array(self, array_idx: int, kind: str, func: str):
+        pyobj = self.jobject_to_pyobject(self.get_reference(array_idx))
+        actual = getattr(pyobj, "jni_kind", None)
+        if actual is not None and actual != kind:
+            raise ValueError(f"{func} on {pyobj.jvm_name}, an array of {actual!r} elements")
+        return pyobj
+
+    @staticmethod
+    def __region(func: str, array_len: int, start: int, length: int):
+        start, length = _jint(start), _jint(length)
+        if start < 0 or length < 0 or start + length > array_len:
+            raise IndexError(
+                f"ArrayIndexOutOfBoundsException: {func}(start={start}, length={length}) on an array of length {array_len}"
+            )
+        return start, length
+
+    def __new_prim_array(self, kind: str, length: int):
+        func = f"New{_PRIM_NAME[kind]}Array"
+        length = _jint(length)
+        if length < 0:
+            raise ValueError(f"NegativeArraySizeException: {func}({length})")
+        clazz = self._class_loader.find_class_by_name(f"[{kind}")
+        if clazz is None:
+            raise RuntimeError(f"{func}: class [{kind} is not registered")
+        zero = 0.0 if kind in "FD" else 0
+        return self.add_local_reference(jobject(clazz([zero] * length)))
+
+    def __get_prim_region(self, emu: "Emulator", array_idx: int, start: int, length: int, buf_ptr: int, kind: str):
+        func = f"Get{_PRIM_NAME[kind]}ArrayRegion"
+        items = self.__prim_array(array_idx, kind, func).get_py_items()
+        start, length = self.__region(func, len(items), start, length)
+        if length == 0:
+            return
+        emu.mu.mem_write(buf_ptr, _pack_elements(kind, items[start:start + length]))
+
+    def __set_prim_region(self, emu: "Emulator", array_idx: int, start: int, length: int, buf_ptr: int, kind: str):
+        func = f"Set{_PRIM_NAME[kind]}ArrayRegion"
+        pyobj = self.__prim_array(array_idx, kind, func)
+        start, length = self.__region(func, len(pyobj.get_py_items()), start, length)
+        if length == 0:
+            return
+        data = bytes(emu.mu.mem_read(buf_ptr, length * _PRIM_ELEMENT[kind][2]))
+        _assign_region(pyobj, start, _unpack_elements(kind, data))
+
     @native_method
     def get_array_length(self, emu: "Emulator", env, array):
         obj = self.get_reference(array)
@@ -1187,7 +1280,8 @@ class JNIEnv:
         array_pyobj[index] = self.jobject_to_pyobject(self.get_reference(obj_idx))
 
     @native_method
-    def new_boolean_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_boolean_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("Z", length)
 
     @native_method
     def new_byte_array(self, emu: "Emulator", env, bytelen):
@@ -1195,17 +1289,23 @@ class JNIEnv:
         return self.add_local_reference(jobject(self._array(barr)))
 
     @native_method
-    def new_char_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_char_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("C", length)
     @native_method
-    def new_short_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_short_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("S", length)
     @native_method
-    def new_int_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_int_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("I", length)
     @native_method
-    def new_long_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_long_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("J", length)
     @native_method
-    def new_float_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_float_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("F", length)
     @native_method
-    def new_double_array(self, emu: "Emulator", env): raise NotImplementedError()
+    def new_double_array(self, emu: "Emulator", env, length):
+        return self.__new_prim_array("D", length)
 
     @native_method
     def get_boolean_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
@@ -1266,7 +1366,8 @@ class JNIEnv:
     def release_double_array_elements(self, emu: "Emulator", env): raise NotImplementedError()
 
     @native_method
-    def get_boolean_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_boolean_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "Z")
 
     @native_method
     def get_byte_array_region(self, emu: "Emulator", env, array_idx, start, len_in, buf_ptr):
@@ -1283,20 +1384,27 @@ class JNIEnv:
         emu.mu.mem_write(buf_ptr, bytes(barr[start : start + length]))
 
     @native_method
-    def get_char_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_char_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "C")
     @native_method
-    def get_short_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_short_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "S")
     @native_method
-    def get_int_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_int_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "I")
     @native_method
-    def get_long_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_long_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "J")
     @native_method
-    def get_float_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_float_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "F")
     @native_method
-    def get_double_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def get_double_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__get_prim_region(emu, array_idx, start, length, buf_ptr, "D")
 
     @native_method
-    def set_boolean_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_boolean_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "Z")
 
     @native_method
     def set_byte_array_region(self, emu: "Emulator", env, arrayJREF, startIndex, length, bufAddress):
@@ -1321,17 +1429,23 @@ class JNIEnv:
         items[start:start + length] = data
 
     @native_method
-    def set_char_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_char_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "C")
     @native_method
-    def set_short_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_short_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "S")
     @native_method
-    def set_int_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_int_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "I")
     @native_method
-    def set_long_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_long_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "J")
     @native_method
-    def set_float_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_float_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "F")
     @native_method
-    def set_double_array_region(self, emu: "Emulator", env): raise NotImplementedError()
+    def set_double_array_region(self, emu: "Emulator", env, array_idx, start, length, buf_ptr):
+        self.__set_prim_region(emu, array_idx, start, length, buf_ptr, "D")
 
     @native_method
     def get_primitive_array_critical(self, emu: "Emulator", env, array_idx, is_copy_ptr):
