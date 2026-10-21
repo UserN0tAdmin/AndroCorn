@@ -1212,8 +1212,6 @@ class JNIEnv:
 
     @native_method
     def get_byte_array_elements(self, emu: "Emulator", env, array_idx, is_copy_ptr):
-        if is_copy_ptr != 0:
-            raise NotImplementedError()
         pyobj = self.jobject_to_pyobject(self.get_reference(array_idx))
         items = pyobj.get_py_items()
         items_len = len(items)
@@ -1221,7 +1219,10 @@ class JNIEnv:
 
         buf = self.__libc.malloc(extra_n + items_len)
         emu.mu.mem_write(buf, items_len.to_bytes(4, "little"))
-        emu.mu.mem_write(buf + extra_n, bytes(items))
+        if items_len:
+            emu.mu.mem_write(buf + extra_n, bytes(items))
+        if is_copy_ptr != JAVA_NULL:  # the buffer is always a copy: tell the caller (a NULL isCopy is allowed)
+            emu.mu.mem_write(is_copy_ptr, bytes([JNI_TRUE]))
         return buf + extra_n
 
     @native_method

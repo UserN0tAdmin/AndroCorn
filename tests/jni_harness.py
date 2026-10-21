@@ -21,7 +21,8 @@ from androidemu.java.jni.reference import jobject, jclass
 ARCHES = (emu_const.ARCH_ARM32, emu_const.ARCH_ARM64)
 
 MEM_BASE = 0x10000
-MEM_SIZE = 0x1000
+MEM_SIZE = 0x4000
+HEAP_ADDR = MEM_BASE + 0x1000   # the arena of FakeLibC.malloc
 STACK_ADDR = MEM_BASE + 0xC00   # where call() puts arguments that do not fit into registers
 
 # jvalue is a union, every element occupies 8 bytes on both ABIs (little endian).
@@ -62,6 +63,24 @@ class FakeMu:
         self._mem[off:off + len(data)] = data
 
 
+class FakeLibC:
+    """Stands in for LibC (which would run the emulated libc's malloc/free): a bump allocator that remembers what was freed."""
+
+    def __init__(self):
+        self.next = HEAP_ADDR
+        self.sizes = {}
+        self.freed = []
+
+    def malloc(self, size: int) -> int:
+        ptr = self.next
+        self.next += (size + 15) & ~15
+        self.sizes[ptr] = size
+        return ptr
+
+    def free(self, ptr: int):
+        self.freed.append(ptr)
+
+
 class FakeHooker:
     def write_function_table(self, table):
         return 0, 0
@@ -86,6 +105,8 @@ class Harness:
         )
         self.env = JNIEnv(self.emu, self.loader, FakeHooker())
         self.emu.java_vm.jni_env = self.env
+        self.libc = FakeLibC()
+        self.env._JNIEnv__libc = self.libc
 
     # --- references -------------------------------------------------------------------
     def add_class(self, pyclazz):
