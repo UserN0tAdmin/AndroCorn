@@ -13,12 +13,15 @@ from unicorn.arm64_const import UC_ARM64_REG_Q0, UC_ARM64_REG_Q31
 from androidemu.const import emu_const
 from androidemu.core.registers import RegistersMapping
 from androidemu.java.classloader import JavaClassLoader
-from androidemu.java.classes.java.lang.array import Array
+from androidemu.java.classes.java.lang.array import (
+    Array, BooleanArray, ByteArray, CharArray, DoubleArray, FloatArray, IntArray, LongArray, ShortArray,
+)
 from androidemu.java.classes.java.lang.string import String
 from androidemu.java.jni.main import JNIEnv
 from androidemu.java.jni.reference import jobject, jclass
 
 ARCHES = (emu_const.ARCH_ARM32, emu_const.ARCH_ARM64)
+ARRAY_CLASSES = (BooleanArray, ByteArray, CharArray, ShortArray, IntArray, LongArray, FloatArray, DoubleArray)
 
 MEM_BASE = 0x10000
 MEM_SIZE = 0x4000
@@ -97,6 +100,8 @@ class Harness:
         # JNIEnv looks these two up once, in its constructor (NewByteArray & co. create Array objects)
         self.loader.add_class(String)
         self.loader.add_class(Array)
+        for array_class in ARRAY_CLASSES:
+            self.loader.add_class(array_class)
         self.emu = SimpleNamespace(
             arch=arch,
             mu=self.mu,

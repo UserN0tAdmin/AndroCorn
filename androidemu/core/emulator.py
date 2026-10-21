@@ -210,7 +210,8 @@ class Emulator:
             Boolean, Byte, Character, Double, Float, Integer, Long, Short
         )
         from ..java.classes.java.lang.array import (
-            Array, ByteArray, ObjectArray, ClassArray, StringArray, IntArray
+            Array, ByteArray, ObjectArray, ClassArray, StringArray, IntArray,
+            BooleanArray, CharArray, ShortArray, LongArray, FloatArray, DoubleArray,
         )
         from ..java.classes.java.lang.reflect.constructor import Constructor
         from ..java.classes.java.lang.reflect.executable import Executable
@@ -227,6 +228,7 @@ class Emulator:
             Class, Object, String, System,
             Boolean, Byte, Character, Double, Float, Integer, Long, Short,
             Array, ByteArray, ObjectArray, ClassArray, StringArray, IntArray,
+            BooleanArray, CharArray, ShortArray, LongArray, FloatArray, DoubleArray,
             AccessibleObject, Executable, Constructor, Field, Method, Proxy,
             File, JavaList, HashMap, JavaSet, TimeUnit,
         ]
