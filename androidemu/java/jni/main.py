@@ -1272,7 +1272,15 @@ class JNIEnv:
     def get_byte_array_region(self, emu: "Emulator", env, array_idx, start, len_in, buf_ptr):
         pyobj = self.jobject_to_pyobject(self.get_reference(array_idx))
         barr = pyobj.get_py_items()
-        emu.mu.mem_write(buf_ptr, bytes(barr[start : start + len_in]))
+        start, length = _jint(start), _jint(len_in)
+        if start < 0 or length < 0 or start + length > len(barr):
+            raise IndexError(
+                f"ArrayIndexOutOfBoundsException: GetByteArrayRegion(start={start}, length={length}) "
+                f"on an array of length {len(barr)}"
+            )
+        if length == 0:
+            return
+        emu.mu.mem_write(buf_ptr, bytes(barr[start : start + length]))
 
     @native_method
     def get_char_array_region(self, emu: "Emulator", env): raise NotImplementedError()

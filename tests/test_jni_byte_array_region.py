@@ -101,5 +101,39 @@ class TestSetByteArrayRegion(unittest.TestCase):
         self.assertEqual(bytes(arr.get_py_items()), b"abXYZf")
 
 
+class TestGetByteArrayRegion(unittest.TestCase):
+
+    def setup(self, arch, items=b"abcdef"):
+        h = Harness(arch)
+        arr = ByteArray(bytearray(items))
+        h.mu.mem_write(BUF, b"\xEE" * 8)                    # what the buffer held before
+        return h, arr, h.obj_ref(arr)
+
+    def test_copies_the_requested_region(self):
+        for arch in ARCHES:
+            with self.subTest(arch=arch):
+                h, arr, ref = self.setup(arch)
+                h.call("get_byte_array_region", 0, ref, 2, 3, BUF)
+                self.assertEqual(bytes(h.mu.mem_read(BUF, 8)), b"cde" + b"\xEE" * 5)
+
+    def test_whole_array_and_empty_region(self):
+        for arch in ARCHES:
+            with self.subTest(arch=arch):
+                h, arr, ref = self.setup(arch)
+                h.call("get_byte_array_region", 0, ref, 0, 6, BUF)
+                self.assertEqual(bytes(h.mu.mem_read(BUF, 6)), b"abcdef")
+                h.call("get_byte_array_region", 0, ref, 6, 0, 0)      # length 0 at the end, NULL buffer: fine
+
+    def test_out_of_range_raises_instead_of_clamping(self):
+        bad = [(4, 3), (7, 0), (3, 4), (0xFFFFFFFF, 1), (1, 0xFFFFFFFF)]
+        for arch in ARCHES:
+            for start, length in bad:
+                with self.subTest(arch=arch, start=start, length=length):
+                    h, arr, ref = self.setup(arch)
+                    with self.assertRaisesRegex(IndexError, "ArrayIndexOutOfBounds"):
+                        h.call("get_byte_array_region", 0, ref, start, length, BUF)
+                    self.assertEqual(bytes(h.mu.mem_read(BUF, 8)), b"\xEE" * 8)   # nothing was written
+
+
 if __name__ == "__main__":
     unittest.main()
